@@ -323,6 +323,18 @@ def test_invalid_cursor_and_limit_rejected(api_server):
         assert resp.status_code == 400, huge_cursor
         assert resp.json()["detail"]["error"] == "invalid_cursor"
 
+    # 超过 Python 整数转换安全上限（4300 位）的超长纯数字游标：同样 400 而非 500
+    for long_cursor in [
+        f"{'9' * 4301}:1",
+        f"1:{'9' * 4301}",
+        f"{'9' * 5000}:{'9' * 5000}",
+    ]:
+        resp = httpx.get(
+            f"{base}/api/events", params={"cursor": long_cursor}, timeout=10.0
+        )
+        assert resp.status_code == 400, f"cursor 长度 {len(long_cursor)}"
+        assert resp.json()["detail"]["error"] == "invalid_cursor"
+
     # 边界值（int64 上限）是合法游标：正常返回快照范围内的全部事件而非报错
     boundary = httpx.get(
         f"{base}/api/events",

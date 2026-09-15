@@ -116,20 +116,30 @@ _CURSOR_RE = re.compile(r"^(\d+):(\d+)$")
 # 必须在进入存储层之前判为无效游标（400），而不是放大成服务器错误（500）。
 _SQLITE_INT64_MAX = 2**63 - 1
 
+# int64 上限 9223372036854775807 共 19 位十进制：位数更多的分量不可能是合法
+# 序号。必须在 int() 转换前按位数拦截——Python 对整数字符串转换设有安全上限
+# （默认 4300 位），超限会抛 ValueError，同样会放大成 500。
+_INT64_MAX_DIGITS = 19
+
 
 def _parse_events_cursor(cursor: str) -> tuple[int, int]:
     """Parse and validate a feed cursor into ``(snapshot, before)``.
 
-    Rejects anything that is not two non-negative decimal integers, a
-    ``before`` below 1 (sequence numbers start at 1) and components outside
-    the SQLite 64-bit integer range.
+    Rejects anything that is not two non-negative decimal integers, components
+    with more digits than a 64-bit integer can have, a ``before`` below 1
+    (sequence numbers start at 1) and values outside the SQLite 64-bit range.
     """
     match = _CURSOR_RE.match(cursor)
     if match is not None:
-        snapshot = int(match.group(1))
-        before = int(match.group(2))
-        if 1 <= before <= _SQLITE_INT64_MAX and snapshot <= _SQLITE_INT64_MAX:
-            return snapshot, before
+        raw_snapshot, raw_before = match.group(1), match.group(2)
+        if (
+            len(raw_snapshot) <= _INT64_MAX_DIGITS
+            and len(raw_before) <= _INT64_MAX_DIGITS
+        ):
+            snapshot = int(raw_snapshot)
+            before = int(raw_before)
+            if 1 <= before <= _SQLITE_INT64_MAX and snapshot <= _SQLITE_INT64_MAX:
+                return snapshot, before
     raise HTTPException(
         status_code=400,
         detail={
