@@ -30,6 +30,28 @@ export interface UpdateNotesBody {
   notes: string;
 }
 
+/** 操作流水中的一条事件：某次成功领取或某个真正生成的新备注修订。 */
+export interface OperationEvent {
+  /** 全局序号：严格等于事务提交先后 */
+  seq: number;
+  /** issued = 领取镜号；note_revised = 备注修订 */
+  event_type: 'issued' | 'note_revised';
+  scene_id: string;
+  client_op_id: string;
+  shot_number: number;
+  /** 事件对应的备注修订号（领取恒为 1） */
+  revision: number;
+  /** 事件发生时的备注快照 */
+  notes: string;
+  created_at: string;
+}
+
+/** 流水的一页。next_cursor 为 null 表示当次浏览快照已翻完。 */
+export interface EventsPage {
+  events: OperationEvent[];
+  next_cursor: string | null;
+}
+
 /** 三方合并冲突中一个重叠片段的按行内容。 */
 export interface NotesConflictFragment {
   base: string[];

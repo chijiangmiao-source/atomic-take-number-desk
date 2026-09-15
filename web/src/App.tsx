@@ -8,6 +8,7 @@ import {
   type FormEvent,
 } from 'react';
 import { createHttpApi } from './lib/api';
+import { EventFeedView } from './EventFeed';
 import { Issuer } from './lib/issuer';
 import {
   draftsReducer,
@@ -499,6 +500,8 @@ export default function App() {
             </table>
           )}
         </section>
+
+        <EventFeedView api={api} />
       </main>
     </div>
   );

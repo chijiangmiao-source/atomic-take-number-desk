@@ -327,3 +327,95 @@ tr.editing td {
 .conflict-fragment .meta {
   color: #d9b54a;
 }
+
+/* 操作流水 */
+
+.feed-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.feed-header h2 {
+  margin: 0;
+}
+
+.feed-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.feed-header-actions .meta {
+  font-size: 12px;
+  color: #8b96a2;
+  font-family: ui-monospace, monospace;
+}
+
+.feed-scroll {
+  max-height: 420px;
+  overflow-y: auto;
+  border: 1px solid #232c36;
+  border-radius: 8px;
+}
+
+.feed-scroll table {
+  font-size: 12.5px;
+}
+
+.feed-scroll thead th {
+  position: sticky;
+  top: 0;
+  background: #171d24;
+  z-index: 1;
+}
+
+.feed-notes {
+  max-width: 220px;
+  word-break: break-all;
+  white-space: pre-wrap;
+  color: #c3ccd6;
+}
+
+.feed-type {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.feed-type-issued {
+  background: #12281a;
+  border: 1px solid #2c6e3f;
+  color: #6fe3a1;
+}
+
+.feed-type-note_revised {
+  background: #1a160f;
+  border: 1px solid #8a6d1f;
+  color: #d9b54a;
+}
+
+.feed-sentinel {
+  height: 1px;
+}
+
+.feed-error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #8a3a3a;
+  border-radius: 8px;
+  background: #1a0f0f;
+}
+
+.feed-end {
+  margin-top: 10px;
+  text-align: center;
+}

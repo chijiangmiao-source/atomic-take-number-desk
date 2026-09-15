@@ -13,13 +13,16 @@ function memoryStorage(): KeyValueStorage & { data: Map<string, string> } {
   };
 }
 
-/** 领取相关用例的 API 替身：备注修订接口在这些用例中不应被调用。 */
+/** 领取相关用例的 API 替身：备注修订与流水接口在这些用例中不应被调用。 */
 function mockApi(issue: ShotNumberApi['issue']): ShotNumberApi {
   return {
     issue,
     listSceneOperations: async () => [],
     updateNotes: async () => {
       throw new Error('updateNotes should not be called in issuer tests');
+    },
+    listEvents: async () => {
+      throw new Error('listEvents should not be called in issuer tests');
     },
   };
 }

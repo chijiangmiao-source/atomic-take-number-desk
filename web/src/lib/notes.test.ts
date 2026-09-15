@@ -145,6 +145,9 @@ describe('saveNoteDraft', () => {
       },
       listSceneOperations: async () => [],
       updateNotes,
+      listEvents: async () => {
+        throw new Error('not used');
+      },
     };
   }
 

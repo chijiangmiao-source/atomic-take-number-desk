@@ -9,6 +9,14 @@ The database is the single source of truth for:
                         monotonically increasing ``notes_revision``.
 * ``scene_counters``  — the last issued shot number per scene
 * ``note_revisions``  — full notes history: exactly one row per revision
+* ``operation_events``— append-only operation feed: exactly one row per committed
+                        business change (a successful issuance or a genuinely new
+                        notes revision), carrying the business snapshot of that
+                        moment (scene, shot number, revision, notes text, time).
+                        ``seq`` is a global AUTOINCREMENT assigned inside the
+                        serialized write transaction, so it strictly follows the
+                        commit order.  Idempotent replays, no-change saves and
+                        rejected requests write NO event row.
 
 Issuance transaction boundary
 -----------------------------
@@ -21,13 +29,14 @@ Issuance transaction boundary
         DO UPDATE ... RETURNING last_value
       INSERT INTO operations ...                    -- durable operation mapping
       INSERT INTO note_revisions ... (revision 1)   -- first notes revision
+      INSERT INTO operation_events ... ('issued')   -- feed event: snapshot at issuance
     COMMIT
 
 Notes revision transaction boundary
 -----------------------------------
 ``Storage.update_notes`` also performs exactly one transaction; the current-text
-UPDATE and the history INSERT commit or roll back together, and it never touches
-scene_id, shot_number, the counters or client_op_id::
+UPDATE, the history INSERT and the feed event commit or roll back together, and
+it never touches scene_id, shot_number, the counters or client_op_id::
 
     BEGIN IMMEDIATE
       SELECT operations WHERE client_op_id = ?      -- current text + revision
@@ -37,6 +46,7 @@ scene_id, shot_number, the counters or client_op_id::
       --   overlapping edits -> ROLLBACK, nothing changes, 409 with fragments
       UPDATE operations SET notes, notes_revision   -- current text + revision bump
       INSERT INTO note_revisions ...                -- history row for the new revision
+      INSERT INTO operation_events ... ('note_revised')  -- feed event: new snapshot
     COMMIT
 
 * ``BEGIN IMMEDIATE`` acquires the database write lock up front, so at most one
@@ -48,6 +58,18 @@ scene_id, shot_number, the counters or client_op_id::
   (or an injected post-commit failure) the same ``client_op_id`` simply replays
   the committed number — even after the notes were revised, because the
   idempotency fingerprint is the immutable ``issue_notes``.
+* The feed event is the LAST insert of each transaction, so an event exists iff
+  its business change committed; a rolled-back transaction leaves no event.
+
+Event feed pagination
+---------------------
+``Storage.list_events`` serves keyset pages over the feed, newest first.  The
+first request of a browsing session pins ``snapshot = MAX(seq)``; every
+subsequent page of that session carries the cursor ``"<snapshot>:<before>"``
+and reads only rows with ``seq <= snapshot AND seq < before``.  Events
+committed while the user is paging therefore never leak into the ongoing
+session — they appear after the next refresh (a fresh snapshot).  Pages can
+neither repeat nor skip events, regardless of concurrent writers.
 
 Schema migration
 ----------------
@@ -55,6 +77,14 @@ Databases created before notes became revisable are migrated automatically at
 startup (no manual step): the missing columns are added, the existing notes are
 copied into ``issue_notes`` as the request fingerprint, ``notes_revision``
 starts at 1 and revision 1 is seeded into ``note_revisions``.
+
+Databases created before the operation feed existed are backfilled in the same
+startup transaction: one event per ``note_revisions`` row (revision 1 = the
+issuance, higher revisions = note edits), ordered by occurrence time, then
+issuance-before-revision, then client_op_id, then revision number.  The
+backfill is guarded by ``UNIQUE (client_op_id, revision)`` plus a NOT EXISTS
+filter, so re-running it (every restart) changes nothing — backfilled ``seq``
+values stay stable forever.
 
 SQLite is opened in WAL mode with ``synchronous=FULL`` so a committed
 transaction survives an OS/process crash before any response is sent.
@@ -96,6 +126,20 @@ CREATE TABLE IF NOT EXISTS note_revisions (
     created_at    TEXT NOT NULL,
     PRIMARY KEY (client_op_id, revision)
 );
+
+-- 只追加的操作流水：每次成功领取 / 每个真正生成的新备注修订各一行，
+-- 与对应业务变更在同一事务提交；seq 全局递增，严格等于提交先后。
+CREATE TABLE IF NOT EXISTS operation_events (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type   TEXT NOT NULL,  -- 'issued' | 'note_revised'
+    client_op_id TEXT NOT NULL,
+    scene_id     TEXT NOT NULL,
+    shot_number  INTEGER NOT NULL,
+    revision     INTEGER NOT NULL,  -- 事件对应的备注修订号（领取恒为 1）
+    notes        TEXT NOT NULL,     -- 事件发生时的备注快照
+    created_at   TEXT NOT NULL,
+    UNIQUE (client_op_id, revision)  -- 幂等补建与并发写入的去重约束
+);
 """
 
 # Outcome statuses returned by Storage.issue
@@ -109,6 +153,10 @@ NOTE_UNCHANGED = "note_unchanged"      # merged text identical to current: no ne
 NOTE_NOT_FOUND = "note_not_found"      # unknown client_op_id
 NOTE_CONFLICT = "note_conflict"        # overlapping edits: rolled back, 409 with fragments
 NOTE_INVALID_BASE = "note_invalid_base"  # base_revision outside [1, current_revision]
+
+# Event types stored in operation_events
+EVENT_ISSUED = "issued"              # a shot number was issued (always revision 1)
+EVENT_NOTE_REVISED = "note_revised"  # a genuinely new notes revision was committed
 
 _OPERATION_COLUMNS = (
     "client_op_id, scene_id, issue_notes, notes, notes_revision, shot_number, created_at"
@@ -151,6 +199,37 @@ class NoteRevision:
             "revision": self.revision,
             "notes": self.notes,
             "base_revision": self.base_revision,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class OperationEvent:
+    """One committed entry of the append-only operation feed.
+
+    Carries the business snapshot at the moment of the change: which scene and
+    shot number it concerns, the notes revision it produced and the notes text
+    that became current right then.
+    """
+
+    seq: int
+    event_type: str  # EVENT_ISSUED | EVENT_NOTE_REVISED
+    client_op_id: str
+    scene_id: str
+    shot_number: int
+    revision: int
+    notes: str
+    created_at: str
+
+    def as_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "event_type": self.event_type,
+            "client_op_id": self.client_op_id,
+            "scene_id": self.scene_id,
+            "shot_number": self.shot_number,
+            "revision": self.revision,
+            "notes": self.notes,
             "created_at": self.created_at,
         }
 
@@ -297,11 +376,19 @@ class Storage:
             self._migrate()
 
     def _migrate(self) -> None:
-        """Upgrade a pre-revision database in place (idempotent, no manual step).
+        """Upgrade an older database in place (idempotent, no manual step).
 
-        Existing notes become the immutable ``issue_notes`` fingerprint AND the
-        current text at revision 1; revision 1 is seeded into the history so
-        every operation has a contiguous revision chain starting at 1.
+        * Pre-revision databases: existing notes become the immutable
+          ``issue_notes`` fingerprint AND the current text at revision 1;
+          revision 1 is seeded into the history so every operation has a
+          contiguous revision chain starting at 1.
+        * Pre-feed databases: the append-only ``operation_events`` log is
+          backfilled from ``note_revisions`` (revision 1 = the issuance, higher
+          revisions = note edits), ordered by occurrence time, then
+          issuance-before-revision, then client_op_id, then revision number.
+          The NOT EXISTS guard (backed by UNIQUE(client_op_id, revision))
+          makes the backfill a no-op on every later restart, so the assigned
+          ``seq`` values remain stable.
         """
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(operations)")
@@ -328,6 +415,24 @@ class Storage:
                 "   SELECT 1 FROM note_revisions r"
                 "   WHERE r.client_op_id = o.client_op_id AND r.revision = 1"
                 " )"
+            )
+            cur.execute(
+                "INSERT INTO operation_events"
+                " (event_type, client_op_id, scene_id, shot_number, revision,"
+                "  notes, created_at)"
+                " SELECT CASE WHEN r.revision = 1 THEN ? ELSE ? END,"
+                "        r.client_op_id, o.scene_id, o.shot_number, r.revision,"
+                "        r.notes, r.created_at"
+                " FROM note_revisions r"
+                " JOIN operations o ON o.client_op_id = r.client_op_id"
+                " WHERE NOT EXISTS ("
+                "   SELECT 1 FROM operation_events e"
+                "   WHERE e.client_op_id = r.client_op_id AND e.revision = r.revision"
+                " )"
+                " ORDER BY r.created_at,"
+                "          CASE WHEN r.revision = 1 THEN 0 ELSE 1 END,"
+                "          r.client_op_id, r.revision",
+                (EVENT_ISSUED, EVENT_NOTE_REVISED),
             )
             cur.execute("COMMIT")
         except Exception:
@@ -400,6 +505,13 @@ class Storage:
                     " (client_op_id, revision, notes, base_revision, created_at)"
                     " VALUES (?, 1, ?, 0, ?)",
                     (client_op_id, notes, created_at),
+                )
+                cur.execute(
+                    "INSERT INTO operation_events"
+                    " (event_type, client_op_id, scene_id, shot_number, revision,"
+                    "  notes, created_at)"
+                    " VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (EVENT_ISSUED, client_op_id, scene_id, last_value, notes, created_at),
                 )
                 cur.execute("COMMIT")
                 return IssueOutcome(
@@ -524,6 +636,21 @@ class Storage:
                     " VALUES (?, ?, ?, ?, ?)",
                     (client_op_id, new_revision, merged, base_revision, created_at),
                 )
+                cur.execute(
+                    "INSERT INTO operation_events"
+                    " (event_type, client_op_id, scene_id, shot_number, revision,"
+                    "  notes, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        EVENT_NOTE_REVISED,
+                        client_op_id,
+                        current.scene_id,
+                        current.shot_number,
+                        new_revision,
+                        merged,
+                        created_at,
+                    ),
+                )
                 cur.execute("COMMIT")
                 return NoteUpdateOutcome(
                     NOTE_UPDATED,
@@ -578,6 +705,52 @@ class Storage:
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _row_to_event(row: sqlite3.Row) -> OperationEvent:
+        return OperationEvent(
+            seq=row["seq"],
+            event_type=row["event_type"],
+            client_op_id=row["client_op_id"],
+            scene_id=row["scene_id"],
+            shot_number=row["shot_number"],
+            revision=row["revision"],
+            notes=row["notes"],
+            created_at=row["created_at"],
+        )
+
+    def list_events(
+        self, *, snapshot: Optional[int], before: Optional[int], limit: int
+    ) -> tuple:
+        """One keyset page of the operation feed, newest first.
+
+        ``snapshot`` is the inclusive upper ``seq`` bound pinned for the whole
+        browsing session (``None`` pins it to the current maximum, i.e. a
+        refresh).  ``before`` is the exclusive cursor position carried over
+        from the previous page.  Events committed after the snapshot was pinned
+        are invisible to the session, so paging can neither repeat nor skip.
+        Returns ``(events, snapshot, has_more)``.
+        """
+        with self._lock:
+            if snapshot is None:
+                snapshot = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM operation_events"
+                ).fetchone()[0]
+            sql = (
+                "SELECT seq, event_type, client_op_id, scene_id, shot_number,"
+                " revision, notes, created_at"
+                " FROM operation_events WHERE seq <= ?"
+            )
+            params: list = [snapshot]
+            if before is not None:
+                sql += " AND seq < ?"
+                params.append(before)
+            sql += " ORDER BY seq DESC LIMIT ?"
+            params.append(limit + 1)  # one extra row tells us whether more pages exist
+            rows = self._conn.execute(sql, params).fetchall()
+        has_more = len(rows) > limit
+        events = [self._row_to_event(row) for row in rows[:limit]]
+        return events, snapshot, has_more
 
     def close(self) -> None:
         with self._lock:

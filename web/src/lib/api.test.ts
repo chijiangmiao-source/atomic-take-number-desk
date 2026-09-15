@@ -127,6 +127,87 @@ describe('createHttpApi.issue', () => {
   });
 });
 
+describe('createHttpApi.listEvents', () => {
+  const feedPage = {
+    events: [
+      {
+        seq: 7,
+        event_type: 'issued',
+        scene_id: 'A-1',
+        client_op_id: 'op-7',
+        shot_number: 3,
+        revision: 1,
+        notes: '长镜头',
+        created_at: '2026-09-15T00:00:07.000Z',
+      },
+    ],
+    next_cursor: '9:7',
+  };
+
+  it('首页不带游标，返回一页事件与下一游标', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, feedPage));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await api.listEvents({ limit: 25 });
+
+    expect(res.events).toHaveLength(1);
+    expect(res.events[0].seq).toBe(7);
+    expect(res.next_cursor).toBe('9:7');
+    expect(fetchMock).toHaveBeenCalledWith('/api/events?limit=25');
+  });
+
+  it('续页携带上一页返回的游标', async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(200, { events: [], next_cursor: null }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await api.listEvents({ cursor: '9:7', limit: 25 });
+
+    expect(res.next_cursor).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith('/api/events?cursor=9%3A7&limit=25');
+  });
+
+  it('网络异常映射为可重试错误（已显示内容应被保留）', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('fetch failed');
+      }),
+    );
+
+    const err = await api.listEvents({ cursor: '9:7' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RetryableError);
+  });
+
+  it('5xx 映射为可重试错误', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(503, { detail: { message: '服务不可用' } })),
+    );
+
+    const err = await api.listEvents({}).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RetryableError);
+    expect((err as RetryableError).status).toBe(503);
+  });
+
+  it('400（游标无效）映射为不可重试的请求错误', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse(400, { detail: { error: 'invalid_cursor', message: '游标格式无效' } }),
+      ),
+    );
+
+    const err = await api.listEvents({ cursor: 'bad' }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RequestError);
+    expect((err as RequestError).status).toBe(400);
+  });
+});
+
 describe('createHttpApi.updateNotes', () => {
   it('200 返回更新后的操作（含新修订号）', async () => {
     const payload = {

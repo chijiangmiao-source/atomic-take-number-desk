@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
 
 from .storage import (
@@ -17,6 +18,7 @@ from .storage import (
     REPLAYED,
     NoteRevision,
     Operation,
+    OperationEvent,
     Storage,
 )
 
@@ -86,6 +88,31 @@ class NoteRevisionModel(BaseModel):
         return cls(**rev.as_dict())
 
 
+class OperationEventModel(BaseModel):
+    seq: int
+    event_type: str  # "issued" | "note_revised"
+    scene_id: str
+    client_op_id: str
+    shot_number: int
+    revision: int
+    notes: str  # 事件发生时的备注快照
+    created_at: str
+
+    @classmethod
+    def from_event(cls, event: OperationEvent) -> "OperationEventModel":
+        return cls(**event.as_dict())
+
+
+class EventsPageModel(BaseModel):
+    events: list[OperationEventModel]
+    # 下一页游标（"<快照序号>:<本页末条序号>"）；为 null 表示本次快照已翻完。
+    next_cursor: Optional[str]
+
+
+# 游标格式："<snapshot_seq>:<before_seq>"，由服务端在上一页的 next_cursor 中签发。
+_CURSOR_RE = re.compile(r"^(\d+):(\d+)$")
+
+
 # ---------------------------------------------------------------------------
 # Application factory
 # ---------------------------------------------------------------------------
@@ -100,7 +127,7 @@ def create_app(
         allow_failure_injection = _env_flag("ALLOW_FAILURE_INJECTION")
 
     storage = Storage(db_path)
-    app = FastAPI(title="Shot Number Issuer", version="1.1.0")
+    app = FastAPI(title="Shot Number Issuer", version="1.2.0")
     app.state.storage = storage
     app.state.allow_failure_injection = allow_failure_injection
 
@@ -249,6 +276,46 @@ def create_app(
             NoteRevisionModel.from_revision(rev)
             for rev in storage.list_note_revisions(client_op_id)
         ]
+
+    @app.get("/api/events", response_model=EventsPageModel)
+    def list_events(
+        cursor: Optional[str] = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> EventsPageModel:
+        """Cursor-paginated operation feed, newest first.
+
+        The first request of a browsing session carries no cursor: the server
+        pins the current maximum ``seq`` as the session snapshot and returns
+        the newest page.  Each response carries ``next_cursor``; passing it
+        back keeps reading strictly inside the pinned snapshot, so events
+        committed while the user is paging appear only after a fresh
+        (cursor-less) request.
+        """
+        snapshot: Optional[int] = None
+        before: Optional[int] = None
+        if cursor is not None:
+            match = _CURSOR_RE.match(cursor)
+            if match is None or int(match.group(2)) < 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_cursor",
+                        "message": "游标格式无效：请使用上一页返回的 next_cursor",
+                    },
+                )
+            snapshot = int(match.group(1))
+            before = int(match.group(2))
+
+        events, resolved_snapshot, has_more = storage.list_events(
+            snapshot=snapshot, before=before, limit=limit
+        )
+        next_cursor = (
+            f"{resolved_snapshot}:{events[-1].seq}" if has_more and events else None
+        )
+        return EventsPageModel(
+            events=[OperationEventModel.from_event(event) for event in events],
+            next_cursor=next_cursor,
+        )
 
     return app
 

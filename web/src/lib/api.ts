@@ -1,4 +1,5 @@
 import type {
+  EventsPage,
   IssueRequestBody,
   IssueResponse,
   IssuedOperation,
@@ -54,6 +55,7 @@ export interface ShotNumberApi {
   issue(body: IssueRequestBody): Promise<IssueResponse>;
   listSceneOperations(sceneId: string): Promise<IssuedOperation[]>;
   updateNotes(clientOpId: string, body: UpdateNotesBody): Promise<IssuedOperation>;
+  listEvents(params: { cursor?: string | null; limit?: number }): Promise<EventsPage>;
 }
 
 interface ErrorDetail {
@@ -189,6 +191,36 @@ export function createHttpApi(baseUrl = ''): ShotNumberApi {
           : `备注保存被拒绝（HTTP ${res.status}）`,
         res.status,
       );
+    },
+
+    async listEvents(params: {
+      cursor?: string | null;
+      limit?: number;
+    }): Promise<EventsPage> {
+      const search = new URLSearchParams();
+      if (params.cursor) search.set('cursor', params.cursor);
+      if (params.limit !== undefined) search.set('limit', String(params.limit));
+      const query = search.toString();
+      let res: Response;
+      try {
+        res = await fetch(`${baseUrl}/api/events${query ? `?${query}` : ''}`);
+      } catch {
+        throw new RetryableError('网络异常：流水加载失败，已显示内容保留，可就地重试');
+      }
+      if (!res.ok) {
+        const detail = await parseErrorBody(res);
+        if (res.status >= 500) {
+          const base = detail.message ?? '服务暂时不可用，已显示内容保留，可就地重试';
+          throw new RetryableError(`${base}（HTTP ${res.status}）`, res.status);
+        }
+        throw new RequestError(
+          detail.message
+            ? `流水加载被拒绝：${detail.message}`
+            : `流水加载被拒绝（HTTP ${res.status}）`,
+          res.status,
+        );
+      }
+      return (await res.json()) as EventsPage;
     },
   };
 }

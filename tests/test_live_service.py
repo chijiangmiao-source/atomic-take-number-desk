@@ -161,3 +161,57 @@ def test_live_notes_revision_merge_and_conflict_flow():
     )
     assert nxt.status_code == 201
     assert nxt.json()["shot_number"] == 2
+
+
+def test_live_events_feed_snapshot_and_pagination():
+    """操作流水：领取与修订各产生一条事件；首屏固定快照，新事件刷新后才出现。"""
+    scene = _scene()
+    op_a = uuid.uuid4().hex
+    op_b = uuid.uuid4().hex
+
+    issued_a = httpx.post(
+        f"{BASE_URL}/api/shot-numbers",
+        json={"scene_id": scene, "client_op_id": op_a, "notes": "流水A"},
+        timeout=10.0,
+    )
+    assert issued_a.status_code == 201
+    revised_a = _update_notes(op_a, 1, "流水A·改")
+    assert revised_a.status_code == 200
+    issued_b = httpx.post(
+        f"{BASE_URL}/api/shot-numbers",
+        json={"scene_id": scene, "client_op_id": op_b, "notes": "流水B"},
+        timeout=10.0,
+    )
+    assert issued_b.status_code == 201
+
+    # 首屏（limit=1）：最新事件是 B 的领取；游标固定了当次快照
+    page1 = httpx.get(f"{BASE_URL}/api/events", params={"limit": 1}, timeout=10.0).json()
+    assert page1["events"][0]["client_op_id"] == op_b
+    assert page1["events"][0]["event_type"] == "issued"
+    assert page1["events"][0]["revision"] == 1
+    cursor = page1["next_cursor"]
+    assert cursor
+
+    # 浏览期间的新写入
+    op_c = uuid.uuid4().hex
+    issued_c = httpx.post(
+        f"{BASE_URL}/api/shot-numbers",
+        json={"scene_id": scene, "client_op_id": op_c, "notes": "流水C"},
+        timeout=10.0,
+    )
+    assert issued_c.status_code == 201
+
+    # 续页只读快照范围：依次是 A 的修订与 A 的领取，C 不出现
+    page2 = httpx.get(
+        f"{BASE_URL}/api/events", params={"cursor": cursor, "limit": 2}, timeout=10.0
+    ).json()
+    assert [e["client_op_id"] for e in page2["events"]] == [op_a, op_a]
+    assert [e["event_type"] for e in page2["events"]] == ["note_revised", "issued"]
+    assert page2["events"][0]["revision"] == 2
+    assert page2["events"][0]["notes"] == "流水A·改"
+    assert op_c not in {e["client_op_id"] for e in page2["events"]}
+
+    # 刷新流水（不带游标）：C 的领取成为最新事件
+    fresh = httpx.get(f"{BASE_URL}/api/events", params={"limit": 1}, timeout=10.0).json()
+    assert fresh["events"][0]["client_op_id"] == op_c
+    assert fresh["events"][0]["event_type"] == "issued"
