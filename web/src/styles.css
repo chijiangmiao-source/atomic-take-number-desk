@@ -264,3 +264,66 @@ td.mono {
   font-size: 12px;
   color: #8b96a2;
 }
+
+tr.editing td {
+  background: #131a21;
+}
+
+.note-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.note-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.note-editor-actions .meta {
+  font-size: 12px;
+  color: #8b96a2;
+  font-family: ui-monospace, monospace;
+}
+
+.conflict-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid #8a6d1f;
+  border-radius: 8px;
+  background: #1a160f;
+}
+
+.conflict-columns {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.conflict-columns .meta {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: #8b96a2;
+}
+
+.conflict-panel pre {
+  margin: 0;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid #2a3441;
+  background: #0d1117;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 140px;
+  overflow: auto;
+}
+
+.conflict-fragment .meta {
+  color: #d9b54a;
+}

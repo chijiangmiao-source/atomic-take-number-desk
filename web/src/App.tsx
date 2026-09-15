@@ -1,6 +1,20 @@
-import { useCallback, useEffect, useState, useSyncExternalStore, type FormEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type FormEvent,
+} from 'react';
 import { createHttpApi } from './lib/api';
 import { Issuer } from './lib/issuer';
+import {
+  draftsReducer,
+  mergeOperationsByRevision,
+  saveNoteDraft,
+  type NoteDraft,
+} from './lib/notes';
 import type { IssuedOperation } from './lib/types';
 
 const api = createHttpApi();
@@ -9,6 +23,140 @@ const NOTES_MAX_LENGTH = 4000;
 
 function shortId(id: string): string {
   return id.length <= 12 ? id : `${id.slice(0, 8)}…`;
+}
+
+interface SceneOpRowProps {
+  op: IssuedOperation;
+  draft: NoteDraft | undefined;
+  onBegin: () => void;
+  onEdit: (text: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+}
+
+/** 看板行：静态展示，或行内编辑（编辑中 / 保存中 / 冲突）三种草稿状态。 */
+function SceneOpRow({ op, draft, onBegin, onEdit, onSave, onCancel }: SceneOpRowProps) {
+  if (!draft) {
+    return (
+      <tr data-testid="scene-op-row">
+        <td className="num">#{op.shot_number}</td>
+        <td>{op.notes || '—'}</td>
+        <td className="mono" data-testid="note-revision">
+          r{op.notes_revision}
+        </td>
+        <td className="mono">{shortId(op.client_op_id)}</td>
+        <td className="mono">{op.created_at}</td>
+        <td>
+          <button
+            type="button"
+            className="ghost"
+            data-testid="note-edit-button"
+            onClick={onBegin}
+          >
+            编辑
+          </button>
+        </td>
+      </tr>
+    );
+  }
+
+  const saving = draft.status === 'saving';
+  const tooLong = draft.text.length > NOTES_MAX_LENGTH;
+  return (
+    <tr data-testid="scene-op-row" className="editing">
+      <td className="num">#{op.shot_number}</td>
+      <td colSpan={5}>
+        <div className="note-editor">
+          <textarea
+            data-testid="note-editor"
+            rows={3}
+            value={draft.text}
+            disabled={saving}
+            aria-invalid={tooLong}
+            onChange={(e) => onEdit(e.target.value)}
+          />
+          {tooLong && (
+            <span className="error-text">
+              备注超过 {NOTES_MAX_LENGTH} 字上限，请精简后再保存
+            </span>
+          )}
+          {saving && (
+            <span className="hint" data-testid="note-saving">
+              保存中…
+            </span>
+          )}
+          {draft.status === 'editing' && draft.error && (
+            <span className="error-text" data-testid="note-save-error">
+              {draft.error}（输入已保留，可再次保存）
+            </span>
+          )}
+          {draft.status === 'editing' && op.notes_revision > draft.baseRevision && (
+            <span className="hint">
+              提示：服务端已更新到 r{op.notes_revision}，保存时将按行自动合并。
+            </span>
+          )}
+          {draft.status === 'conflict' && (
+            <div className="conflict-panel" data-testid="note-conflict-panel">
+              <strong>
+                保存冲突：服务端已是 r{draft.conflict.current_revision}
+                ，你的输入已保留在上方编辑框。
+              </strong>
+              <span className="hint">
+                请对照三方文本与重叠片段，在编辑框里整理后再次保存。
+              </span>
+              <div className="conflict-columns">
+                <div>
+                  <span className="meta">基础文本（r{draft.conflict.base_revision}）</span>
+                  <pre data-testid="conflict-base">{draft.conflict.base_notes || '（空）'}</pre>
+                </div>
+                <div>
+                  <span className="meta">服务端当前（r{draft.conflict.current_revision}）</span>
+                  <pre data-testid="conflict-server">
+                    {draft.conflict.server_notes || '（空）'}
+                  </pre>
+                </div>
+                <div>
+                  <span className="meta">你的修改（未保存）</span>
+                  <pre data-testid="conflict-local">{draft.conflict.local_notes || '（空）'}</pre>
+                </div>
+              </div>
+              {draft.conflict.conflicts.map((fragment, index) => (
+                <div className="conflict-fragment" key={index}>
+                  <span className="meta">重叠片段 {index + 1}（基础 / 服务端 / 你的）</span>
+                  <div className="conflict-columns">
+                    <pre>{fragment.base.join('\n') || '（空）'}</pre>
+                    <pre>{fragment.server.join('\n') || '（空）'}</pre>
+                    <pre>{fragment.local.join('\n') || '（空）'}</pre>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="note-editor-actions">
+            <button
+              type="button"
+              className="primary"
+              data-testid="note-save-button"
+              disabled={saving || tooLong}
+              onClick={onSave}
+            >
+              {saving ? '保存中…' : draft.status === 'conflict' ? '再次保存' : '保存'}
+            </button>
+            <button
+              type="button"
+              className="ghost"
+              data-testid="note-cancel-button"
+              disabled={saving}
+              onClick={onCancel}
+            >
+              取消
+            </button>
+            <span className="meta">基于 r{draft.baseRevision}</span>
+          </div>
+        </div>
+      </td>
+    </tr>
+  );
 }
 
 export default function App() {
@@ -25,6 +173,9 @@ export default function App() {
 
   const [sceneOps, setSceneOps] = useState<IssuedOperation[]>([]);
   const [boardError, setBoardError] = useState<string | null>(null);
+  const [drafts, dispatchDrafts] = useReducer(draftsReducer, {});
+  // 当前看板场次的最新值：用于丢弃场次切换前发出的过期轮询响应
+  const boardSceneRef = useRef(sceneId);
 
   const refreshBoard = useCallback(async (scene: string) => {
     const trimmed = scene.trim();
@@ -33,15 +184,20 @@ export default function App() {
       return;
     }
     try {
-      setSceneOps(await api.listSceneOperations(trimmed));
+      const ops = await api.listSceneOperations(trimmed);
+      if (boardSceneRef.current.trim() !== trimmed) return; // 场次已切换，丢弃过期响应
+      // 按修订号合并：较旧的轮询响应不得覆盖已知的新修订
+      setSceneOps((prev) => mergeOperationsByRevision(prev, ops));
       setBoardError(null);
     } catch {
+      if (boardSceneRef.current.trim() !== trimmed) return;
       setBoardError('场次看板刷新失败：镜号服务不可达');
     }
   }, []);
 
   const issuedCount = snapshot.issued.length;
   useEffect(() => {
+    boardSceneRef.current = sceneId;
     void refreshBoard(sceneId);
     const timer = window.setInterval(() => void refreshBoard(sceneId), 3000);
     return () => window.clearInterval(timer);
@@ -83,6 +239,37 @@ export default function App() {
     }
   };
 
+  const onSaveNote = async (clientOpId: string) => {
+    const draft = drafts[clientOpId];
+    if (!draft || draft.status === 'saving') return;
+    if (draft.text.length > NOTES_MAX_LENGTH) return;
+    dispatchDrafts({ type: 'saving', clientOpId });
+    const result = await saveNoteDraft(api, clientOpId, draft);
+    if (result.kind === 'saved') {
+      dispatchDrafts({ type: 'saved', clientOpId });
+      // 保存响应即最新状态：直接合入看板，无需等待下一轮轮询
+      setSceneOps((prev) => mergeOperationsByRevision(prev, [result.operation]));
+    } else if (result.kind === 'conflict') {
+      dispatchDrafts({ type: 'conflict', clientOpId, conflict: result.conflict });
+      // 让看板行的静态文本跟上服务端当前修订
+      setSceneOps((prev) =>
+        prev.map((op) =>
+          op.client_op_id === clientOpId &&
+          result.conflict.current_revision > op.notes_revision
+            ? {
+                ...op,
+                notes: result.conflict.server_notes,
+                notes_revision: result.conflict.current_revision,
+              }
+            : op,
+        ),
+      );
+    } else {
+      // 网络失败或其它错误：草稿保留，输入不丢
+      dispatchDrafts({ type: 'failed', clientOpId, error: result.error });
+    }
+  };
+
   const latest = snapshot.issued[0] ?? null;
 
   return (
@@ -90,7 +277,7 @@ export default function App() {
       <header className="page-header">
         <h1>镜号发放台</h1>
         <p className="subtitle">
-          多台场记终端并发领取镜号：同一操作标识重试永远取回同一号码，号码严格连续、以提交顺序为准。
+          多台场记终端并发领取镜号：同一操作标识重试永远取回同一号码，号码严格连续、以提交顺序为准。发放后备注仍可在场次看板行内修订。
         </p>
       </header>
 
@@ -120,7 +307,7 @@ export default function App() {
                 data-testid="notes-input"
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
-                placeholder="镜头内容备注，可留空"
+                placeholder="镜头内容备注，可留空；发放后仍可在看板修订"
                 rows={2}
                 aria-invalid={notesTooLong}
               />
@@ -268,25 +455,45 @@ export default function App() {
             场次看板{sceneId.trim() ? `：${sceneId.trim()}` : ''}（已发放 {sceneOps.length} 条）
           </h2>
           {boardError && <p className="error-text">{boardError}</p>}
-          {!sceneId.trim() && <p className="hint">填写场次后此处实时显示该场次已发放的镜号。</p>}
+          {!sceneId.trim() && (
+            <p className="hint">
+              填写场次后此处实时显示该场次已发放的镜号；点击行内“编辑”可修订备注，镜号不变。
+            </p>
+          )}
           {sceneOps.length > 0 && (
             <table>
               <thead>
                 <tr>
                   <th>镜号</th>
                   <th>备注</th>
+                  <th>修订</th>
                   <th>操作标识</th>
                   <th>发放时间 (UTC)</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 {sceneOps.map((op) => (
-                  <tr key={op.client_op_id} data-testid="scene-op-row">
-                    <td className="num">#{op.shot_number}</td>
-                    <td>{op.notes || '—'}</td>
-                    <td className="mono">{shortId(op.client_op_id)}</td>
-                    <td className="mono">{op.created_at}</td>
-                  </tr>
+                  <SceneOpRow
+                    key={op.client_op_id}
+                    op={op}
+                    draft={drafts[op.client_op_id]}
+                    onBegin={() =>
+                      dispatchDrafts({
+                        type: 'begin',
+                        clientOpId: op.client_op_id,
+                        text: op.notes,
+                        baseRevision: op.notes_revision,
+                      })
+                    }
+                    onEdit={(text) =>
+                      dispatchDrafts({ type: 'edit', clientOpId: op.client_op_id, text })
+                    }
+                    onSave={() => void onSaveNote(op.client_op_id)}
+                    onCancel={() =>
+                      dispatchDrafts({ type: 'cancel', clientOpId: op.client_op_id })
+                    }
+                  />
                 ))}
               </tbody>
             </table>

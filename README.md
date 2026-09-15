@@ -6,7 +6,8 @@
 - **提交顺序**：号码分配顺序等于数据库事务提交顺序；
 - **幂等**：相同 `client_op_id` + 相同内容，无论并发、超时重试还是进程重启，永远返回最初发放的号码；
 - **冲突拒绝**：相同 `client_op_id` 携带不同内容，返回 `409`；
-- **崩溃安全**：服务在“落库后、回包前”崩溃，重试仍能取回已提交的号码。
+- **崩溃安全**：服务在“落库后、回包前”崩溃，重试仍能取回已提交的号码；
+- **备注可修订**：发放后场记可在场次看板行内修订备注，镜号不变；发放时的备注作为不可变请求指纹，修订不影响幂等重放。
 
 ## 架构
 
@@ -50,8 +51,8 @@ docker compose --profile acceptance up --build --exit-code-from verify verify
 `verify` 服务依次执行（任一步失败即整体失败，退出码非 0）：
 
 1. 检查 `web → api` 反向代理链路与健康检查；
-2. **pytest**：20 并发无重号无缺号、重复提交幂等、409 冲突、**进程重启后映射与计数恢复**、故障注入后重试取回原号码（其中 `test_live_service.py` 直接打向 compose 中运行的 `api` 服务）；
-3. **Vitest**：前端待重试保留、本地持久化、重试幂等键不变、409 反馈等逻辑。
+2. **pytest**：20 并发无重号无缺号、重复提交幂等、409 冲突、**进程重启后映射与计数恢复**、故障注入后重试取回原号码、**旧库自动迁移与迁移重放、两终端不相交编辑合并、重叠编辑 409 及解决、备注修订不影响镜号序列**（其中 `test_live_service.py` 直接打向 compose 中运行的 `api` 服务）；
+3. **Vitest**：前端待重试保留、本地持久化、重试幂等键不变、409 反馈、**备注草稿状态机（编辑/保存中/冲突）与过期轮询合并**等逻辑。
 
 ## 幂等协议与事务边界
 
@@ -72,12 +73,13 @@ docker compose --profile acceptance up --build --exit-code-from verify verify
 ```
 BEGIN IMMEDIATE                        -- 立即取得写锁，串行化所有发放事务
   SELECT operations                    -- ① 按 client_op_id 查已提交映射
-    ├─ 命中且内容一致 → COMMIT，返回原号码（幂等重放，不动计数器）
-    └─ 命中但内容不同 → ROLLBACK，返回 409（不动计数器）
+    ├─ 命中且指纹一致 → COMMIT，返回原号码（幂等重放，不动计数器）
+    └─ 命中但指纹不同 → ROLLBACK，返回 409（不动计数器）
   INSERT INTO scene_counters …         -- ② 场次计数器原子 +1（不存在则从 1 开始）
     ON CONFLICT DO UPDATE … RETURNING
   INSERT INTO operations …             -- ③ 写入 client_op_id → 镜号 的持久映射
-COMMIT                                 -- ④ 提交后号码才对其他连接可见
+  INSERT INTO note_revisions …         -- ④ 备注的第 1 个修订（发放文本）
+COMMIT                                 -- 提交后号码才对其他连接可见
 ```
 
 关键性质：
@@ -85,7 +87,34 @@ COMMIT                                 -- ④ 提交后号码才对其他连接�
 - **无重号**：`BEGIN IMMEDIATE` 使写事务互斥，计数器递增与映射插入串行执行；
 - **无缺口**：计数器递增与映射插入在**同一事务**中，任何失败整体回滚，不会“烧了号码却没落映射”；
 - **提交顺序即号码顺序**：号码在事务内分配、提交后立即可见，并发请求的号码次序等于事务提交次序；
-- **崩溃安全**：`synchronous=FULL` + WAL，COMMIT 返回即落盘；响应阶段的崩溃不影响已提交数据，客户端重试走路径 ① 取回号码。
+- **崩溃安全**：`synchronous=FULL` + WAL，COMMIT 返回即落盘；响应阶段的崩溃不影响已提交数据，客户端重试走路径 ① 取回号码；
+- **指纹不可变**：幂等判定的“内容一致”指 `scene_id` + **发放时备注**（`issue_notes`，落库后不再改变）。之后对备注的任何修订都不会把合法重试误判成冲突。
+
+### 备注修订（`Storage.update_notes`）
+
+发放后备注仍可修订：场记在看板行内编辑并保存，镜号、场次、计数器、`client_op_id` 均不变。每条操作的备注带一个从 1 开始单调递增的修订号，全部历史版本落在 `note_revisions` 表中。
+
+```
+BEGIN IMMEDIATE                        -- 同样串行化所有修订事务
+  SELECT operations                    -- 当前文本 + 当前修订号
+  -- base_revision == 当前修订号：新文本直接生效（快路径）
+  -- base_revision <  当前修订号：确定性的按行三方合并
+  --   （基础修订文本 vs 服务端当前文本 vs 本次提交文本）
+  --   · 不相交改动 → 自动合并，且只产生一个新修订
+  --   · 重叠改动   → ROLLBACK，数据库保持原样，409 返回三方片段
+  UPDATE operations SET notes, notes_revision   -- 当前文本 + 修订号 +1
+  INSERT INTO note_revisions …                  -- 新修订的历史行（同事务提交）
+COMMIT
+```
+
+- 备注更新与修订记录在**同一事务**提交，不会出现“改了当前文本却丢了历史”；
+- 合并是**确定性**的：同样的三方输入永远得到同样结果（按行 diff3，无随机、无时间依赖）；
+- **重试安全**：保存响应在网络中丢失后，客户端用相同 `(base_revision, notes)` 重试，合并会重现当前文本，服务端视为无变化返回现状，不产生重复修订；
+- 409 响应携带 `base_notes` / `server_notes` / `local_notes` 全文与按行的重叠片段，场记对照整理后以 `current_revision` 为基础再次保存即可。
+
+### 旧库迁移
+
+老版本数据库（无 `issue_notes` / `notes_revision` / `note_revisions`）在服务启动时**自动迁移，无需人工处理**：现有备注被复制为不可变的发放指纹，修订号从 1 开始，并向历史表播种第 1 个修订。迁移是幂等的，重复启动不会改动已迁移数据；迁移后同一 `client_op_id` 携发放时备注重试仍取回原号码。
 
 ### 故障注入（仅开发模式）
 
@@ -102,7 +131,9 @@ COMMIT                                 -- ④ 提交后号码才对其他连接�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/shot-numbers` | 领取镜号。新操作返回 `201`，幂等重放返回 `200`（`replayed: true`），内容冲突返回 `409`，注入故障返回 `503` |
-| `GET` | `/api/scenes/{scene_id}/operations` | 场次已发放镜号列表（按号码升序） |
+| `POST` | `/api/operations/{client_op_id}/notes` | 修订备注。成功返回 `200`（含新修订号）；基础修订落后时不相交改动自动合并；重叠改动返回 `409`（含三方片段）；操作不存在返回 `404` |
+| `GET` | `/api/operations/{client_op_id}/notes/history` | 备注修订历史（按修订号升序；操作不存在返回 `404`） |
+| `GET` | `/api/scenes/{scene_id}/operations` | 场次已发放镜号列表（按号码升序，含当前备注与修订号） |
 | `GET` | `/api/operations/{client_op_id}` | 按操作标识查询（不存在返回 `404`） |
 | `GET` | `/api/health` | 健康检查 |
 
@@ -114,6 +145,31 @@ COMMIT                                 -- ④ 提交后号码才对其他连接�
   "client_op_id": "7f3d…（每次新操作唯一）",
   "notes": "雨夜追车长镜头",
   "inject_failure_after_commit": false
+}
+```
+
+`POST /api/operations/{client_op_id}/notes` 请求体：
+
+```json
+{
+  "base_revision": 3,
+  "notes": "整理后的备注文本"
+}
+```
+
+其 `409` 冲突响应（`detail.error == "notes_merge_conflict"`）携带三方信息，数据库保持原样：
+
+```json
+{
+  "detail": {
+    "error": "notes_merge_conflict",
+    "current_revision": 4,
+    "base_revision": 3,
+    "base_notes": "基础修订文本",
+    "server_notes": "服务端当前文本",
+    "local_notes": "本次提交文本",
+    "conflicts": [{ "base": ["…行"], "server": ["…行"], "local": ["…行"] }]
+  }
 }
 ```
 
@@ -150,12 +206,13 @@ cd web && npx playwright install chromium && npm run e2e
 │   └── app/
 │       ├── main.py         # 路由、409/503 语义、故障注入开关
 │       └── storage.py      # 事务边界：BEGIN IMMEDIATE … COMMIT（见文件头注释）
-├── tests/                  # pytest：并发、重启、故障注入、live 服务验收
+├── tests/                  # pytest：并发、重启、故障注入、备注修订/合并/迁移、live 服务验收
 ├── verify/                 # 一次性验收服务（Dockerfile + run.sh）
 └── web/                    # React + TypeScript 前端
     ├── src/lib/issuer.ts   # 待重试操作的持久化与幂等重试
-    ├── src/lib/api.ts      # 409/5xx/网络异常分类
-    └── e2e/                # Playwright：故障后保留待重试、恢复后显示唯一镜号、409 反馈
+    ├── src/lib/notes.ts    # 看板行内编辑的草稿状态机与按修订号合并
+    ├── src/lib/api.ts      # 409/5xx/网络异常分类（含备注合并冲突）
+    └── e2e/                # Playwright：故障后保留待重试、409 反馈、备注行内编辑/合并/冲突/断网重试
 ```
 
 ## 环境变量

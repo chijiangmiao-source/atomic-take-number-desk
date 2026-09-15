@@ -1,29 +1,60 @@
-"""Persistent storage for shot-number issuance.
+"""Persistent storage for shot-number issuance and revisable shot notes.
 
-The database is the single source of truth for two things:
+The database is the single source of truth for:
 
-* ``operations``      — the client_op_id -> shot_number mapping (idempotency log)
+* ``operations``      — the client_op_id -> shot_number mapping (idempotency log).
+                        ``issue_notes`` is the IMMUTABLE issuance-time notes text and
+                        acts as the request fingerprint for idempotency checks;
+                        ``notes`` is the current, revisable text together with its
+                        monotonically increasing ``notes_revision``.
 * ``scene_counters``  — the last issued shot number per scene
+* ``note_revisions``  — full notes history: exactly one row per revision
 
-Transaction boundary
---------------------
+Issuance transaction boundary
+-----------------------------
 ``Storage.issue`` performs exactly one database transaction::
 
     BEGIN IMMEDIATE
       SELECT operations WHERE client_op_id = ?      -- idempotent replay / conflict check
+                                                    -- (fingerprint = scene_id + issue_notes)
       INSERT INTO scene_counters ... ON CONFLICT    -- atomic counter increment
         DO UPDATE ... RETURNING last_value
       INSERT INTO operations ...                    -- durable operation mapping
+      INSERT INTO note_revisions ... (revision 1)   -- first notes revision
+    COMMIT
+
+Notes revision transaction boundary
+-----------------------------------
+``Storage.update_notes`` also performs exactly one transaction; the current-text
+UPDATE and the history INSERT commit or roll back together, and it never touches
+scene_id, shot_number, the counters or client_op_id::
+
+    BEGIN IMMEDIATE
+      SELECT operations WHERE client_op_id = ?      -- current text + revision
+      -- base_revision == current: fast path, the new text wins directly
+      -- base_revision <  current: deterministic line-based three-way merge
+      --   (base revision text vs. current server text vs. submitted text);
+      --   overlapping edits -> ROLLBACK, nothing changes, 409 with fragments
+      UPDATE operations SET notes, notes_revision   -- current text + revision bump
+      INSERT INTO note_revisions ...                -- history row for the new revision
     COMMIT
 
 * ``BEGIN IMMEDIATE`` acquires the database write lock up front, so at most one
-  issuance transaction runs at any moment.  Concurrent requests are serialized
-  and the assigned numbers follow the transaction commit order.
+  issuance/revision transaction runs at any moment.  Concurrent requests are
+  serialized and the assigned numbers follow the transaction commit order.
 * The counter increment and the operation insert commit or roll back together,
   therefore a failed/aborted request can never leave a gap in the sequence.
 * A committed row in ``operations`` is what makes retries safe: after a crash
   (or an injected post-commit failure) the same ``client_op_id`` simply replays
-  the committed number.
+  the committed number — even after the notes were revised, because the
+  idempotency fingerprint is the immutable ``issue_notes``.
+
+Schema migration
+----------------
+Databases created before notes became revisable are migrated automatically at
+startup (no manual step): the missing columns are added, the existing notes are
+copied into ``issue_notes`` as the request fingerprint, ``notes_revision``
+starts at 1 and revision 1 is seeded into ``note_revisions``.
 
 SQLite is opened in WAL mode with ``synchronous=FULL`` so a committed
 transaction survives an OS/process crash before any response is sent.
@@ -31,6 +62,7 @@ transaction survives an OS/process crash before any response is sent.
 
 from __future__ import annotations
 
+import difflib
 import os
 import sqlite3
 import threading
@@ -44,15 +76,26 @@ CREATE TABLE IF NOT EXISTS scene_counters (
 );
 
 CREATE TABLE IF NOT EXISTS operations (
-    client_op_id TEXT PRIMARY KEY,
-    scene_id     TEXT NOT NULL,
-    notes        TEXT NOT NULL,
-    shot_number  INTEGER NOT NULL,
-    created_at   TEXT NOT NULL
+    client_op_id   TEXT PRIMARY KEY,
+    scene_id       TEXT NOT NULL,
+    issue_notes    TEXT NOT NULL,  -- 发放时备注：不可变的请求指纹，参与幂等判定
+    notes          TEXT NOT NULL,  -- 当前备注：可修订内容
+    notes_revision INTEGER NOT NULL,  -- 当前备注修订号（从 1 开始单调递增）
+    shot_number    INTEGER NOT NULL,
+    created_at     TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_operations_scene
     ON operations (scene_id, shot_number);
+
+CREATE TABLE IF NOT EXISTS note_revisions (
+    client_op_id  TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    notes         TEXT NOT NULL,
+    base_revision INTEGER NOT NULL,  -- 本次编辑所基于的修订号（发放版本记为 0）
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (client_op_id, revision)
+);
 """
 
 # Outcome statuses returned by Storage.issue
@@ -60,12 +103,25 @@ ISSUED = "issued"        # a brand-new number was allocated and committed
 REPLAYED = "replayed"    # same client_op_id + same content: original number returned
 CONFLICT = "conflict"    # same client_op_id but different content
 
+# Outcome statuses returned by Storage.update_notes
+NOTE_UPDATED = "note_updated"          # a new revision was committed
+NOTE_UNCHANGED = "note_unchanged"      # merged text identical to current: no new revision
+NOTE_NOT_FOUND = "note_not_found"      # unknown client_op_id
+NOTE_CONFLICT = "note_conflict"        # overlapping edits: rolled back, 409 with fragments
+NOTE_INVALID_BASE = "note_invalid_base"  # base_revision outside [1, current_revision]
+
+_OPERATION_COLUMNS = (
+    "client_op_id, scene_id, issue_notes, notes, notes_revision, shot_number, created_at"
+)
+
 
 @dataclass(frozen=True)
 class Operation:
     client_op_id: str
     scene_id: str
-    notes: str
+    issue_notes: str     # immutable issuance-time notes (idempotency fingerprint)
+    notes: str           # current (revisable) notes
+    notes_revision: int  # revision of the current notes, starts at 1
     shot_number: int
     created_at: str
 
@@ -73,9 +129,45 @@ class Operation:
         return {
             "client_op_id": self.client_op_id,
             "scene_id": self.scene_id,
+            "issue_notes": self.issue_notes,
             "notes": self.notes,
+            "notes_revision": self.notes_revision,
             "shot_number": self.shot_number,
             "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class NoteRevision:
+    client_op_id: str
+    revision: int
+    notes: str
+    base_revision: int
+    created_at: str
+
+    def as_dict(self) -> dict:
+        return {
+            "client_op_id": self.client_op_id,
+            "revision": self.revision,
+            "notes": self.notes,
+            "base_revision": self.base_revision,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class MergeConflict:
+    """One overlapping region of a failed three-way merge (line fragments)."""
+
+    base: tuple   # lines of the base revision
+    server: tuple # lines of the current server text
+    local: tuple  # lines of the submitted (local) text
+
+    def as_dict(self) -> dict:
+        return {
+            "base": list(self.base),
+            "server": list(self.server),
+            "local": list(self.local),
         }
 
 
@@ -83,6 +175,102 @@ class Operation:
 class IssueOutcome:
     status: str  # ISSUED | REPLAYED | CONFLICT
     operation: Optional[Operation] = None  # the stored operation (new or existing)
+
+
+@dataclass(frozen=True)
+class NoteUpdateOutcome:
+    status: str  # NOTE_UPDATED | NOTE_UNCHANGED | NOTE_NOT_FOUND | NOTE_CONFLICT | NOTE_INVALID_BASE
+    operation: Optional[Operation] = None  # current stored operation (when it exists)
+    base_notes: Optional[str] = None       # text of the base revision (conflict fragment)
+    server_notes: Optional[str] = None     # current server text (conflict fragment)
+    local_notes: Optional[str] = None      # submitted text (conflict fragment)
+    conflicts: tuple = ()                  # tuple[MergeConflict, ...] overlapping regions
+
+
+# ---------------------------------------------------------------------------
+# Deterministic line-based three-way merge
+# ---------------------------------------------------------------------------
+
+
+def _matching_map(base_lines: list, other_lines: list) -> dict:
+    """Map matched base-line index -> other-line index (deterministic)."""
+    matcher = difflib.SequenceMatcher(None, base_lines, other_lines, autojunk=False)
+    mapping = {}
+    for block in matcher.get_matching_blocks():
+        for offset in range(block.size):
+            mapping[block.a + offset] = block.b + offset
+    return mapping
+
+
+def _sync_regions(base_lines: list, server_lines: list, local_lines: list) -> list:
+    """Regions where all three texts agree: (base_start, server_start, local_start, len)."""
+    server_map = _matching_map(base_lines, server_lines)
+    local_map = _matching_map(base_lines, local_lines)
+    regions = []
+    i = 0
+    n = len(base_lines)
+    while i < n:
+        if i in server_map and i in local_map:
+            j = i
+            while (
+                j + 1 < n
+                and server_map.get(j + 1) == server_map[j] + 1
+                and local_map.get(j + 1) == local_map[j] + 1
+            ):
+                j += 1
+            regions.append((i, server_map[i], local_map[i], j - i + 1))
+            i = j + 1
+        else:
+            i += 1
+    return regions
+
+
+def merge_lines(base: str, server: str, local: str) -> tuple:
+    """Three-way merge of line-oriented text.
+
+    ``base`` is the revision the local edit started from, ``server`` the current
+    stored text, ``local`` the submitted text.  Returns ``(merged_text, [])``
+    when the changes are disjoint (or identical), or ``(None, conflicts)`` when
+    both sides rewrote the same region differently.  Purely deterministic: the
+    same three inputs always produce the same result.
+    """
+    base_lines = base.split("\n")
+    server_lines = server.split("\n")
+    local_lines = local.split("\n")
+
+    merged: list = []
+    conflicts: list = []
+    i_base = i_server = i_local = 0
+
+    def flush_changed(base_end: int, server_end: int, local_end: int) -> None:
+        base_reg = base_lines[i_base:base_end]
+        server_reg = server_lines[i_server:server_end]
+        local_reg = local_lines[i_local:local_end]
+        if server_reg == base_reg:
+            merged.extend(local_reg)        # only the local side changed
+        elif local_reg == base_reg:
+            merged.extend(server_reg)       # only the server side changed
+        elif server_reg == local_reg:
+            merged.extend(server_reg)       # both sides made the same change
+        else:
+            conflicts.append(
+                MergeConflict(tuple(base_reg), tuple(server_reg), tuple(local_reg))
+            )
+
+    for base_start, server_start, local_start, length in _sync_regions(
+        base_lines, server_lines, local_lines
+    ):
+        flush_changed(base_start, server_start, local_start)
+        if conflicts:
+            return None, conflicts
+        merged.extend(base_lines[base_start : base_start + length])
+        i_base = base_start + length
+        i_server = server_start + length
+        i_local = local_start + length
+    flush_changed(len(base_lines), len(server_lines), len(local_lines))
+    if conflicts:
+        return None, conflicts
+    return "\n".join(merged), []
 
 
 class Storage:
@@ -106,13 +294,54 @@ class Storage:
             self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Upgrade a pre-revision database in place (idempotent, no manual step).
+
+        Existing notes become the immutable ``issue_notes`` fingerprint AND the
+        current text at revision 1; revision 1 is seeded into the history so
+        every operation has a contiguous revision chain starting at 1.
+        """
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(operations)")
+        }
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            if "issue_notes" not in columns:
+                cur.execute(
+                    "ALTER TABLE operations ADD COLUMN issue_notes TEXT NOT NULL DEFAULT ''"
+                )
+                cur.execute("UPDATE operations SET issue_notes = notes")
+            if "notes_revision" not in columns:
+                cur.execute(
+                    "ALTER TABLE operations"
+                    " ADD COLUMN notes_revision INTEGER NOT NULL DEFAULT 1"
+                )
+            cur.execute(
+                "INSERT INTO note_revisions"
+                " (client_op_id, revision, notes, base_revision, created_at)"
+                " SELECT o.client_op_id, 1, o.issue_notes, 0, o.created_at"
+                " FROM operations o"
+                " WHERE NOT EXISTS ("
+                "   SELECT 1 FROM note_revisions r"
+                "   WHERE r.client_op_id = o.client_op_id AND r.revision = 1"
+                " )"
+            )
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _row_to_operation(row: sqlite3.Row) -> Operation:
         return Operation(
             client_op_id=row["client_op_id"],
             scene_id=row["scene_id"],
+            issue_notes=row["issue_notes"],
             notes=row["notes"],
+            notes_revision=row["notes_revision"],
             shot_number=row["shot_number"],
             created_at=row["created_at"],
         )
@@ -121,23 +350,27 @@ class Storage:
         """Allocate the next shot number for ``scene_id`` or replay an existing one.
 
         Everything below happens inside ONE transaction; the shot number becomes
-        visible to any other connection only after COMMIT.
+        visible to any other connection only after COMMIT.  ``notes`` here is the
+        issuance-time text: it is stored as the immutable ``issue_notes``
+        fingerprint, so later revisions of the notes never affect idempotency.
         """
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
             try:
                 row = cur.execute(
-                    "SELECT client_op_id, scene_id, notes, shot_number, created_at"
+                    f"SELECT {_OPERATION_COLUMNS}"
                     " FROM operations WHERE client_op_id = ?",
                     (client_op_id,),
                 ).fetchone()
 
                 if row is not None:
                     existing = self._row_to_operation(row)
-                    if existing.scene_id == scene_id and existing.notes == notes:
+                    if existing.scene_id == scene_id and existing.issue_notes == notes:
                         # Idempotent replay: no counter movement, return the
-                        # originally committed number.
+                        # originally committed number.  The fingerprint is the
+                        # immutable issuance notes, so revising the notes later
+                        # can never turn a legit retry into a conflict.
                         cur.execute("COMMIT")
                         return IssueOutcome(REPLAYED, existing)
                     # Same identifier, different payload: reject without
@@ -157,9 +390,16 @@ class Storage:
                 ).fetchone()[0]
                 cur.execute(
                     "INSERT INTO operations"
-                    " (client_op_id, scene_id, notes, shot_number, created_at)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (client_op_id, scene_id, notes, last_value, created_at),
+                    " (client_op_id, scene_id, issue_notes, notes, notes_revision,"
+                    "  shot_number, created_at)"
+                    " VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (client_op_id, scene_id, notes, notes, last_value, created_at),
+                )
+                cur.execute(
+                    "INSERT INTO note_revisions"
+                    " (client_op_id, revision, notes, base_revision, created_at)"
+                    " VALUES (?, 1, ?, 0, ?)",
+                    (client_op_id, notes, created_at),
                 )
                 cur.execute("COMMIT")
                 return IssueOutcome(
@@ -167,7 +407,9 @@ class Storage:
                     Operation(
                         client_op_id=client_op_id,
                         scene_id=scene_id,
+                        issue_notes=notes,
                         notes=notes,
+                        notes_revision=1,
                         shot_number=last_value,
                         created_at=created_at,
                     ),
@@ -177,23 +419,133 @@ class Storage:
                 # committed the same client_op_id between our check and insert.
                 cur.execute("ROLLBACK")
                 row = self._conn.execute(
-                    "SELECT client_op_id, scene_id, notes, shot_number, created_at"
+                    f"SELECT {_OPERATION_COLUMNS}"
                     " FROM operations WHERE client_op_id = ?",
                     (client_op_id,),
                 ).fetchone()
                 existing = self._row_to_operation(row)
-                if existing.scene_id == scene_id and existing.notes == notes:
+                if existing.scene_id == scene_id and existing.issue_notes == notes:
                     return IssueOutcome(REPLAYED, existing)
                 return IssueOutcome(CONFLICT, existing)
             except Exception:
                 cur.execute("ROLLBACK")
                 raise
 
-    def list_operations(self, scene_id: str) -> list[Operation]:
+    def update_notes(
+        self, *, client_op_id: str, base_revision: int, notes: str
+    ) -> NoteUpdateOutcome:
+        """Revise the notes of an issued operation.
+
+        Exactly one transaction: the current-text UPDATE and the history INSERT
+        commit or roll back together.  scene_id, shot_number, the scene counter
+        and client_op_id are never modified.  When ``base_revision`` lags behind
+        the current revision a deterministic line-based three-way merge runs;
+        overlapping edits roll everything back and report the three fragments.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                row = cur.execute(
+                    f"SELECT {_OPERATION_COLUMNS}"
+                    " FROM operations WHERE client_op_id = ?",
+                    (client_op_id,),
+                ).fetchone()
+                if row is None:
+                    cur.execute("ROLLBACK")
+                    return NoteUpdateOutcome(NOTE_NOT_FOUND)
+
+                current = self._row_to_operation(row)
+                if not 1 <= base_revision <= current.notes_revision:
+                    # The client is based on a revision the server does not have.
+                    cur.execute("ROLLBACK")
+                    return NoteUpdateOutcome(
+                        NOTE_INVALID_BASE,
+                        operation=current,
+                        server_notes=current.notes,
+                        local_notes=notes,
+                    )
+
+                if base_revision == current.notes_revision:
+                    # Fast path: the edit builds on the latest revision.
+                    base_notes = current.notes
+                    merged = notes
+                    conflicts: list = []
+                else:
+                    base_row = cur.execute(
+                        "SELECT notes FROM note_revisions"
+                        " WHERE client_op_id = ? AND revision = ?",
+                        (client_op_id, base_revision),
+                    ).fetchone()
+                    if base_row is None:
+                        # Revisions are contiguous from 1, so this cannot happen;
+                        # treat it defensively as an invalid base.
+                        cur.execute("ROLLBACK")
+                        return NoteUpdateOutcome(
+                            NOTE_INVALID_BASE,
+                            operation=current,
+                            server_notes=current.notes,
+                            local_notes=notes,
+                        )
+                    base_notes = base_row[0]
+                    merged, conflicts = merge_lines(base_notes, current.notes, notes)
+
+                if conflicts:
+                    # Overlapping edits: roll back, the database stays exactly
+                    # as it was; the caller reports the three fragments.
+                    cur.execute("ROLLBACK")
+                    return NoteUpdateOutcome(
+                        NOTE_CONFLICT,
+                        operation=current,
+                        base_notes=base_notes,
+                        server_notes=current.notes,
+                        local_notes=notes,
+                        conflicts=tuple(conflicts),
+                    )
+
+                if merged == current.notes:
+                    # Nothing new (typical case: retry of an update that was
+                    # already applied — the merge reproduces the current text).
+                    cur.execute("COMMIT")
+                    return NoteUpdateOutcome(NOTE_UNCHANGED, operation=current)
+
+                new_revision = current.notes_revision + 1
+                created_at = cur.execute(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+                ).fetchone()[0]
+                cur.execute(
+                    "UPDATE operations SET notes = ?, notes_revision = ?"
+                    " WHERE client_op_id = ?",
+                    (merged, new_revision, client_op_id),
+                )
+                cur.execute(
+                    "INSERT INTO note_revisions"
+                    " (client_op_id, revision, notes, base_revision, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (client_op_id, new_revision, merged, base_revision, created_at),
+                )
+                cur.execute("COMMIT")
+                return NoteUpdateOutcome(
+                    NOTE_UPDATED,
+                    operation=Operation(
+                        client_op_id=current.client_op_id,
+                        scene_id=current.scene_id,
+                        issue_notes=current.issue_notes,
+                        notes=merged,
+                        notes_revision=new_revision,
+                        shot_number=current.shot_number,
+                        created_at=current.created_at,
+                    ),
+                )
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def list_operations(self, scene_id: str) -> list:
         """All issued operations of a scene, ordered by shot number."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT client_op_id, scene_id, notes, shot_number, created_at"
+                f"SELECT {_OPERATION_COLUMNS}"
                 " FROM operations WHERE scene_id = ? ORDER BY shot_number",
                 (scene_id,),
             ).fetchall()
@@ -202,11 +554,30 @@ class Storage:
     def get_operation(self, client_op_id: str) -> Optional[Operation]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT client_op_id, scene_id, notes, shot_number, created_at"
+                f"SELECT {_OPERATION_COLUMNS}"
                 " FROM operations WHERE client_op_id = ?",
                 (client_op_id,),
             ).fetchone()
         return self._row_to_operation(row) if row is not None else None
+
+    def list_note_revisions(self, client_op_id: str) -> list:
+        """Full notes history of an operation, ordered by revision."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT client_op_id, revision, notes, base_revision, created_at"
+                " FROM note_revisions WHERE client_op_id = ? ORDER BY revision",
+                (client_op_id,),
+            ).fetchall()
+        return [
+            NoteRevision(
+                client_op_id=row["client_op_id"],
+                revision=row["revision"],
+                notes=row["notes"],
+                base_revision=row["base_revision"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
 
     def close(self) -> None:
         with self._lock:
