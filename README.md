@@ -151,7 +151,7 @@ COMMIT
 | `POST` | `/api/shot-numbers` | 领取镜号。新操作返回 `201`，幂等重放返回 `200`（`replayed: true`），内容冲突返回 `409`，注入故障返回 `503` |
 | `POST` | `/api/operations/{client_op_id}/notes` | 修订备注。成功返回 `200`（含新修订号）；基础修订落后时不相交改动自动合并；重叠改动返回 `409`（含三方片段）；操作不存在返回 `404` |
 | `GET` | `/api/operations/{client_op_id}/notes/history` | 备注修订历史（按修订号升序；操作不存在返回 `404`） |
-| `GET` | `/api/events` | 操作流水（全片场，最新在前）。首屏不带 `cursor` 固定当次快照并返回 `next_cursor`；后续携带游标只读快照范围。`limit` 默认 50（1–200），游标非法返回 `400` |
+| `GET` | `/api/events` | 操作流水（全片场，最新在前）。首屏不带 `cursor` 固定当次快照并返回 `next_cursor`；后续携带游标只读快照范围。`limit` 默认 50（1–200），游标非法或分量超出 64 位整数范围返回 `400` |
 | `GET` | `/api/scenes/{scene_id}/operations` | 场次已发放镜号列表（按号码升序，含当前备注与修订号） |
 | `GET` | `/api/operations/{client_op_id}` | 按操作标识查询（不存在返回 `404`） |
 | `GET` | `/api/health` | 健康检查 |

@@ -112,6 +112,32 @@ class EventsPageModel(BaseModel):
 # 游标格式："<snapshot_seq>:<before_seq>"，由服务端在上一页的 next_cursor 中签发。
 _CURSOR_RE = re.compile(r"^(\d+):(\d+)$")
 
+# SQLite INTEGER 为 64 位有符号整数；超出范围的游标分量无法绑定为查询参数，
+# 必须在进入存储层之前判为无效游标（400），而不是放大成服务器错误（500）。
+_SQLITE_INT64_MAX = 2**63 - 1
+
+
+def _parse_events_cursor(cursor: str) -> tuple[int, int]:
+    """Parse and validate a feed cursor into ``(snapshot, before)``.
+
+    Rejects anything that is not two non-negative decimal integers, a
+    ``before`` below 1 (sequence numbers start at 1) and components outside
+    the SQLite 64-bit integer range.
+    """
+    match = _CURSOR_RE.match(cursor)
+    if match is not None:
+        snapshot = int(match.group(1))
+        before = int(match.group(2))
+        if 1 <= before <= _SQLITE_INT64_MAX and snapshot <= _SQLITE_INT64_MAX:
+            return snapshot, before
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": "invalid_cursor",
+            "message": "游标无效或超出范围：请使用上一页返回的 next_cursor",
+        },
+    )
+
 
 # ---------------------------------------------------------------------------
 # Application factory
@@ -294,17 +320,7 @@ def create_app(
         snapshot: Optional[int] = None
         before: Optional[int] = None
         if cursor is not None:
-            match = _CURSOR_RE.match(cursor)
-            if match is None or int(match.group(2)) < 1:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": "invalid_cursor",
-                        "message": "游标格式无效：请使用上一页返回的 next_cursor",
-                    },
-                )
-            snapshot = int(match.group(1))
-            before = int(match.group(2))
+            snapshot, before = _parse_events_cursor(cursor)
 
         events, resolved_snapshot, has_more = storage.list_events(
             snapshot=snapshot, before=before, limit=limit

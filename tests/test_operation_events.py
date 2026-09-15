@@ -309,6 +309,31 @@ def test_invalid_cursor_and_limit_rejected(api_server):
         assert resp.status_code == 400, bad_cursor
         assert resp.json()["detail"]["error"] == "invalid_cursor"
 
+    # 超出 SQLite 64 位整数范围的游标分量：同样判为无效游标（400），而非 500
+    int64_max = 2**63 - 1
+    for huge_cursor in [
+        f"{int64_max + 1}:1",          # snapshot 溢出
+        f"1:{int64_max + 1}",          # before 溢出
+        "99999999999999999999999999:1",
+        "1:99999999999999999999999999",
+    ]:
+        resp = httpx.get(
+            f"{base}/api/events", params={"cursor": huge_cursor}, timeout=10.0
+        )
+        assert resp.status_code == 400, huge_cursor
+        assert resp.json()["detail"]["error"] == "invalid_cursor"
+
+    # 边界值（int64 上限）是合法游标：正常返回快照范围内的全部事件而非报错
+    boundary = httpx.get(
+        f"{base}/api/events",
+        params={"cursor": f"{int64_max}:{int64_max}"},
+        timeout=10.0,
+    )
+    assert boundary.status_code == 200
+    boundary_page = boundary.json()
+    assert [e["seq"] for e in boundary_page["events"]] == [1]
+    assert boundary_page["next_cursor"] is None
+
     assert httpx.get(f"{base}/api/events", params={"limit": 0}, timeout=10.0).status_code == 422
     assert httpx.get(f"{base}/api/events", params={"limit": 201}, timeout=10.0).status_code == 422
 
