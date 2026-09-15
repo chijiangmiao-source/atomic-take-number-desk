@@ -90,7 +90,9 @@ export function createHttpApi(baseUrl = ''): ShotNumberApi {
         throw new RetryableError(`${base}（HTTP ${res.status}）`, res.status);
       }
       throw new RequestError(
-        detail.message ?? `请求被拒绝（HTTP ${res.status}）`,
+        detail.message
+          ? `请求被拒绝：${detail.message}`
+          : `请求被拒绝（HTTP ${res.status}）`,
         res.status,
       );
     },

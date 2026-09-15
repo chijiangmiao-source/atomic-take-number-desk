@@ -1,4 +1,4 @@
-import { ConflictError, RetryableError, type ShotNumberApi } from './api';
+import { ConflictError, RequestError, RetryableError, type ShotNumberApi } from './api';
 import type { IssueResponse } from './types';
 
 /** 一次尚未确认成功的操作：网络异常 / 5xx 之后保留在此，等待重试。 */
@@ -35,6 +35,20 @@ export interface KeyValueStorage {
 const STORAGE_KEY = 'shot-number-issuer:pending:v1';
 
 export type IdGenerator = () => string;
+
+/** 一次尝试的结果：页面据此决定是否为主表单更换新标识。 */
+export type AttemptOutcome =
+  | { kind: 'success'; response: IssueResponse }
+  | { kind: 'pending' } // 可重试失败：操作仍保留在待重试列表
+  | { kind: 'conflict' } // 409：标识被不同内容占用
+  | { kind: 'rejected' } // 其它 4xx：请求本身不合法，重试无意义
+  | { kind: 'missing' }; // 操作已不存在（可能刚被处理完）
+
+export interface SubmitResult {
+  /** 实际使用的 client_op_id（与待重试操作撞标识时会另发新标识） */
+  opId: string;
+  outcome: AttemptOutcome;
+}
 
 export function defaultIdGenerator(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -84,32 +98,46 @@ export class Issuer {
   getSnapshot = (): IssuerSnapshot => this.snapshot;
 
   /**
-   * 提交一次新操作。injectFailureAfterCommit 只在首次尝试时透传（开发用），
-   * 重试永远不会再携带它。
+   * 提交一次操作。injectFailureAfterCommit 只在全新操作的首次尝试时透传
+   * （开发用），任何形式的重试都不会再携带它。
+   *
+   * 若传入的 client_op_id 已属于某个待重试操作：
+   * - 内容完全一致 → 视为对那次操作的重试，直接重新尝试，不新建、不覆盖；
+   * - 内容不同 → 这是一个新操作：另发新标识，原待重试操作原样保留，
+   *   仍可从待重试入口取回它的号码。
    */
   async submit(input: {
     scene_id: string;
     notes: string;
     client_op_id?: string;
     injectFailureAfterCommit?: boolean;
-  }): Promise<string> {
+  }): Promise<SubmitResult> {
+    let clientOpId = input.client_op_id?.trim() || this.generateId();
+    const existing = this.pendingOps.get(clientOpId);
+    if (existing) {
+      if (existing.scene_id === input.scene_id && existing.notes === input.notes) {
+        const outcome = await this.attempt(clientOpId, false);
+        return { opId: clientOpId, outcome };
+      }
+      clientOpId = this.generateId();
+    }
     const op: PendingOperation = {
       scene_id: input.scene_id,
       notes: input.notes,
-      client_op_id: input.client_op_id?.trim() || this.generateId(),
+      client_op_id: clientOpId,
       attempts: 0,
       last_error: null,
     };
-    this.pendingOps.set(op.client_op_id, op);
+    this.pendingOps.set(clientOpId, op);
     this.persist();
     this.emit();
-    await this.attempt(op.client_op_id, input.injectFailureAfterCommit === true);
-    return op.client_op_id;
+    const outcome = await this.attempt(clientOpId, input.injectFailureAfterCommit === true);
+    return { opId: clientOpId, outcome };
   }
 
   /** 用最初保存的原始载荷重试一次待重试操作。 */
-  async retry(clientOpId: string): Promise<void> {
-    await this.attempt(clientOpId, false);
+  async retry(clientOpId: string): Promise<AttemptOutcome> {
+    return this.attempt(clientOpId, false);
   }
 
   /** 放弃一个待重试操作（不再重试，从本地存储移除）。 */
@@ -124,10 +152,11 @@ export class Issuer {
     this.emit();
   }
 
-  private async attempt(clientOpId: string, injectFailure: boolean): Promise<void> {
+  private async attempt(clientOpId: string, injectFailure: boolean): Promise<AttemptOutcome> {
     const op = this.pendingOps.get(clientOpId);
-    if (!op) return;
+    if (!op) return { kind: 'missing' };
     op.attempts += 1;
+    let outcome: AttemptOutcome;
     try {
       const res = await this.api.issue({
         scene_id: op.scene_id,
@@ -141,29 +170,47 @@ export class Issuer {
         res,
         ...this.issuedOps.filter((i) => i.client_op_id !== op.client_op_id),
       ];
+      outcome = { kind: 'success', response: res };
     } catch (err) {
       if (err instanceof ConflictError) {
         // 409：标识已被不同内容占用，重试无意义，转入失败列表反馈给现场。
-        this.pendingOps.delete(op.client_op_id);
-        this.failedOps = [
-          {
-            scene_id: op.scene_id,
-            client_op_id: op.client_op_id,
-            notes: op.notes,
-            reason: err.message,
-            existing_shot_number: err.existing?.shot_number ?? null,
-          },
-          ...this.failedOps.filter((f) => f.client_op_id !== op.client_op_id),
-        ];
+        this.moveToFailed(op, err.message, err.existing?.shot_number ?? null);
+        outcome = { kind: 'conflict' };
+      } else if (err instanceof RequestError) {
+        // 其它 4xx（如备注超长）：请求本身不合法，重试永远不会成功。
+        this.moveToFailed(op, err.message, null);
+        outcome = { kind: 'rejected' };
       } else if (err instanceof RetryableError) {
         // 网络异常 / 5xx：操作保留在待重试列表，等待恢复。
         op.last_error = err.message;
+        outcome = { kind: 'pending' };
       } else {
         op.last_error = err instanceof Error ? err.message : String(err);
+        outcome = { kind: 'pending' };
       }
     }
     this.persist();
     this.emit();
+    return outcome;
+  }
+
+  /** 把操作移出待重试并记入失败列表（此类失败重试无意义）。 */
+  private moveToFailed(
+    op: PendingOperation,
+    reason: string,
+    existingShotNumber: number | null,
+  ): void {
+    this.pendingOps.delete(op.client_op_id);
+    this.failedOps = [
+      {
+        scene_id: op.scene_id,
+        client_op_id: op.client_op_id,
+        notes: op.notes,
+        reason,
+        existing_shot_number: existingShotNumber,
+      },
+      ...this.failedOps.filter((f) => f.client_op_id !== op.client_op_id),
+    ];
   }
 
   private loadPersisted(): PendingOperation[] {

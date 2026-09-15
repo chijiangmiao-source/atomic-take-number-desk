@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ConflictError, RetryableError, type ShotNumberApi } from './api';
+import { ConflictError, RequestError, RetryableError, type ShotNumberApi } from './api';
 import { Issuer, type KeyValueStorage, type PendingOperation } from './issuer';
 import type { IssueRequestBody, IssueResponse, IssuedOperation } from './types';
 
@@ -47,9 +47,10 @@ describe('Issuer', () => {
     };
     const issuer = new Issuer(api, memoryStorage(), idSequence());
 
-    const opId = await issuer.submit({ scene_id: 'A-1', notes: '开场' });
+    const { opId, outcome } = await issuer.submit({ scene_id: 'A-1', notes: '开场' });
 
     expect(opId).toBe('op-1');
+    expect(outcome.kind).toBe('success');
     expect(api.issue).toHaveBeenCalledTimes(1);
     const snapshot = issuer.getSnapshot();
     expect(snapshot.pending).toHaveLength(0);
@@ -161,6 +162,119 @@ describe('Issuer', () => {
     expect(snapshot.failed[0].reason).toContain('占用');
     // 冲突操作不应留在本地待重试存储里
     expect(storage.data.has('shot-number-issuer:pending:v1')).toBe(false);
+  });
+
+  it('待重试操作存在时，同标识不同内容的提交另发新标识且保留原操作', async () => {
+    const calls: IssueRequestBody[] = [];
+    let firstOpDown = true;
+    const api: ShotNumberApi = {
+      issue: vi.fn(async (body: IssueRequestBody) => {
+        calls.push(body);
+        if (body.client_op_id === 'op-1') {
+          if (firstOpDown) throw new RetryableError('注入故障（HTTP 503）', 503);
+          return { ...issuedResponse(body, 1), replayed: true };
+        }
+        return issuedResponse(body, 2);
+      }),
+      listSceneOperations: async () => [],
+    };
+    const issuer = new Issuer(api, memoryStorage(), idSequence());
+
+    // 首次提交被注入故障：op-1（原始备注）进入待重试
+    const first = await issuer.submit({
+      scene_id: 'S-1',
+      notes: '原始备注',
+      injectFailureAfterCommit: true,
+    });
+    expect(first.opId).toBe('op-1');
+    expect(first.outcome.kind).toBe('pending');
+
+    // 现场在主表单改了备注再次提交（表单仍拿着 op-1）
+    firstOpDown = false;
+    const second = await issuer.submit({
+      scene_id: 'S-1',
+      notes: '改动后的备注',
+      client_op_id: 'op-1',
+    });
+
+    // 新操作另发新标识并成功；原待重试操作原样保留、内容未被覆盖
+    expect(second.opId).toBe('op-2');
+    expect(second.outcome.kind).toBe('success');
+    const snapshot = issuer.getSnapshot();
+    expect(snapshot.pending).toHaveLength(1);
+    expect(snapshot.pending[0].client_op_id).toBe('op-1');
+    expect(snapshot.pending[0].notes).toBe('原始备注');
+    expect(snapshot.issued[0].shot_number).toBe(2);
+    // 关键：从未用 op-1 发送过改动后的内容（否则服务器会 409 并丢失原操作）
+    expect(
+      calls.some((c) => c.client_op_id === 'op-1' && c.notes === '改动后的备注'),
+    ).toBe(false);
+
+    // 从待重试入口取回原号码：重试仍使用最初保存的原始载荷
+    const retryOutcome = await issuer.retry('op-1');
+    expect(retryOutcome.kind).toBe('success');
+    const op1Calls = calls.filter((c) => c.client_op_id === 'op-1');
+    expect(op1Calls.at(-1)?.notes).toBe('原始备注');
+    expect(issuer.getSnapshot().pending).toHaveLength(0);
+  });
+
+  it('待重试操作存在时，同标识同内容的提交按重试处理（不新建操作）', async () => {
+    const calls: IssueRequestBody[] = [];
+    let down = true;
+    const api: ShotNumberApi = {
+      issue: vi.fn(async (body: IssueRequestBody) => {
+        calls.push(body);
+        if (down) throw new RetryableError('网络异常');
+        return { ...issuedResponse(body, 4), replayed: true };
+      }),
+      listSceneOperations: async () => [],
+    };
+    const issuer = new Issuer(api, memoryStorage(), idSequence());
+
+    await issuer.submit({ scene_id: 'S-9', notes: '同一份内容' });
+    expect(issuer.getSnapshot().pending).toHaveLength(1);
+
+    // 服务恢复：用户不改任何内容直接再点一次提交
+    down = false;
+    const again = await issuer.submit({
+      scene_id: 'S-9',
+      notes: '同一份内容',
+      client_op_id: 'op-1',
+    });
+
+    expect(again.opId).toBe('op-1');
+    expect(again.outcome.kind).toBe('success');
+    expect(calls).toHaveLength(2);
+    expect(calls[1].client_op_id).toBe('op-1');
+    expect(issuer.getSnapshot().issued[0].shot_number).toBe(4);
+    expect(issuer.getSnapshot().pending).toHaveLength(0);
+  });
+
+  it('请求不合法（4xx，如备注超长）进入失败列表，不再显示为可重试', async () => {
+    const api: ShotNumberApi = {
+      issue: vi.fn(async () => {
+        throw new RequestError('请求被拒绝：备注超过 4000 字上限', 422);
+      }),
+      listSceneOperations: async () => [],
+    };
+    const storage = memoryStorage();
+    const issuer = new Issuer(api, storage, idSequence());
+
+    const { outcome } = await issuer.submit({ scene_id: 'S-2', notes: '长'.repeat(4001) });
+
+    expect(outcome.kind).toBe('rejected');
+    const snapshot = issuer.getSnapshot();
+    // 不显示为可重试，也不残留在本地待重试存储中
+    expect(snapshot.pending).toHaveLength(0);
+    expect(storage.data.has('shot-number-issuer:pending:v1')).toBe(false);
+    // 进入失败列表并说明原因
+    expect(snapshot.failed).toHaveLength(1);
+    expect(snapshot.failed[0].reason).toContain('4000');
+
+    // 反复“重试”也不会再发请求
+    const retryOutcome = await issuer.retry('op-1');
+    expect(retryOutcome.kind).toBe('missing');
+    expect(api.issue).toHaveBeenCalledTimes(1);
   });
 
   it('放弃待重试操作后从存储中移除', async () => {

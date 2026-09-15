@@ -5,6 +5,7 @@ import type { IssuedOperation } from './lib/types';
 
 const api = createHttpApi();
 const SCENE_STORAGE_KEY = 'shot-number-issuer:scene';
+const NOTES_MAX_LENGTH = 4000;
 
 function shortId(id: string): string {
   return id.length <= 12 ? id : `${id.slice(0, 8)}…`;
@@ -46,21 +47,39 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [sceneId, issuedCount, refreshBoard]);
 
+  const notesTooLong = notes.length > NOTES_MAX_LENGTH;
+
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     const scene = sceneId.trim();
-    if (!scene || submitting) return;
+    if (!scene || submitting || notesTooLong) return;
     setSubmitting(true);
     try {
       window.localStorage.setItem(SCENE_STORAGE_KEY, scene);
-      await issuer.submit({
+      const { opId: usedId, outcome } = await issuer.submit({
         scene_id: scene,
         notes,
         client_op_id: opId,
         injectFailureAfterCommit: injectFailure,
       });
+      if (outcome.kind === 'success') {
+        // 本次操作已完成：直接为下一条镜号备好新标识，
+        // 现场改完备注即可再次领取，不必手动换标识。
+        setOpId(issuer.newOperationId());
+      } else if (usedId !== opId) {
+        // 标识与某个待重试操作撞车，控制器已另发新标识：同步到表单。
+        setOpId(usedId);
+      }
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const onRetry = async (clientOpId: string) => {
+    const outcome = await issuer.retry(clientOpId);
+    if (outcome.kind === 'success') {
+      // 待重试操作已成功：若主表单还拿着它的标识，一并换新。
+      setOpId((current) => (current === clientOpId ? issuer.newOperationId() : current));
     }
   };
 
@@ -91,18 +110,29 @@ export default function App() {
             </label>
 
             <label className="field">
-              <span>备注</span>
+              <span>
+                备注
+                <span className={notesTooLong ? 'error-text' : 'counter'}>
+                  （{notes.length}/{NOTES_MAX_LENGTH}）
+                </span>
+              </span>
               <textarea
                 data-testid="notes-input"
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
                 placeholder="镜头内容备注，可留空"
                 rows={2}
+                aria-invalid={notesTooLong}
               />
+              {notesTooLong && (
+                <span className="error-text" data-testid="notes-error">
+                  备注超过 {NOTES_MAX_LENGTH} 字上限，请精简后再领取
+                </span>
+              )}
             </label>
 
             <label className="field">
-              <span>操作标识（client_op_id，一次操作一个，重试时保持不变）</span>
+              <span>操作标识（client_op_id；成功领取后自动更换，重试同一操作时保持不变）</span>
               <div className="op-id-row">
                 <input
                   data-testid="op-id-input"
@@ -139,7 +169,7 @@ export default function App() {
               type="submit"
               className="primary"
               data-testid="submit-button"
-              disabled={submitting || !sceneId.trim() || !opId.trim()}
+              disabled={submitting || !sceneId.trim() || !opId.trim() || notesTooLong}
             >
               {submitting ? '提交中…' : '领取下一条镜号'}
             </button>
@@ -186,7 +216,7 @@ export default function App() {
                   <button
                     type="button"
                     data-testid="retry-button"
-                    onClick={() => void issuer.retry(op.client_op_id)}
+                    onClick={() => void onRetry(op.client_op_id)}
                   >
                     重试
                   </button>
@@ -206,7 +236,7 @@ export default function App() {
 
         {snapshot.failed.length > 0 && (
           <section className="card danger" data-testid="failed-list">
-            <h2>冲突操作（{snapshot.failed.length}）</h2>
+            <h2>失败操作（重试无效，{snapshot.failed.length}）</h2>
             {snapshot.failed.map((op) => (
               <div className="op-card" data-testid="failed-card" key={op.client_op_id}>
                 <div className="op-card-main">
